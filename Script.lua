@@ -1,0 +1,462 @@
+--[[
+Single-file Key System (Server script that injects a LocalScript client)
+Place this Script into ServerScriptService.
+It will:
+ - create RemoteEvent/RemoteFunction in ReplicatedStorage
+ - run server-side KeyManager + daily reset at 06:00 GMT+7
+ - create/update a LocalScript under StarterPlayer > StarterPlayerScripts with client UI
+--]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local StarterPlayer = game:GetService("StarterPlayer")
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+
+-- ==== CONFIG ====
+local CONFIG = {
+    HubTitle = "HaiRoblox",
+    AnimationText = "Youtube: Trung IOS",
+    KeyLinkToday = "https://yeumoney.com/Exrfa", -- Link key hôm nay
+    InitialKeys = {"9997","ABC-123-TEST","DAILY-0001"},
+    OneTimeUse = true,
+    RateLimit = {limit = 8, window = 5} -- requests
+}
+
+-- ==== CREATE REMOTES (if not exists) ====
+local VerifyKey = ReplicatedStorage:FindFirstChild("VerifyKey")
+if not VerifyKey then
+    VerifyKey = Instance.new("RemoteEvent")
+    VerifyKey.Name = "VerifyKey"
+    VerifyKey.Parent = ReplicatedStorage
+end
+
+local KeyResponse = ReplicatedStorage:FindFirstChild("KeyResponse")
+if not KeyResponse then
+    KeyResponse = Instance.new("RemoteEvent")
+    KeyResponse.Name = "KeyResponse"
+    KeyResponse.Parent = ReplicatedStorage
+end
+
+local RequestKeyLink = ReplicatedStorage:FindFirstChild("RequestKeyLink")
+if not RequestKeyLink then
+    RequestKeyLink = Instance.new("RemoteFunction")
+    RequestKeyLink.Name = "RequestKeyLink"
+    RequestKeyLink.Parent = ReplicatedStorage
+end
+
+-- ==== SERVER-SIDE KEY MANAGER ====
+local KeyManager = {}
+KeyManager.Config = {
+    Keys = CONFIG.InitialKeys,
+    OneTimeUse = CONFIG.OneTimeUse,
+    CurrentKeyLink = CONFIG.KeyLinkToday
+}
+
+local validKeys = {} -- key -> {used = bool, created = timestamp}
+local redeemed = {}  -- key -> {userId, time}
+local requests = {}  -- userId -> {count, ts}
+
+local function initKeys()
+    validKeys = {}
+    local now = os.time()
+    for _,k in ipairs(KeyManager.Config.Keys) do
+        validKeys[k] = { used = false, created = now }
+    end
+end
+initKeys()
+
+function KeyManager:IsValidKey(key)
+    if type(key) ~= "string" then return false end
+    local e = validKeys[key]
+    if not e then return false end
+    if KeyManager.Config.OneTimeUse and e.used then return false end
+    return true
+end
+
+function KeyManager:RedeemKey(key, userId)
+    if not self:IsValidKey(key) then
+        return false, "Key invalid or already used"
+    end
+    if KeyManager.Config.OneTimeUse then
+        validKeys[key].used = true
+    end
+    redeemed[key] = { userId = userId, time = os.time() }
+    return true
+end
+
+function KeyManager:GetKeyLink()
+    return KeyManager.Config.CurrentKeyLink
+end
+
+function KeyManager:SetKeyLink(newLink)
+    if type(newLink) ~= "string" then return false end
+    KeyManager.Config.CurrentKeyLink = newLink
+    return true
+end
+
+function KeyManager:SetKeys(newKeys)
+    if type(newKeys) ~= "table" then return false end
+    KeyManager.Config.Keys = newKeys
+    initKeys()
+    return true
+end
+
+function KeyManager:ResetKeys()
+    initKeys()
+    return true
+end
+
+function KeyManager:IsRateLimited(userId, limit, window)
+    limit = limit or CONFIG.RateLimit.limit
+    window = window or CONFIG.RateLimit.window
+    local now = tick()
+    requests[userId] = requests[userId] or {count = 0, ts = now}
+    local info = requests[userId]
+    if now - info.ts > window then
+        info.ts = now
+        info.count = 0
+    end
+    info.count = info.count + 1
+    return info.count > limit
+end
+
+-- ==== SERVER EVENT HANDLERS ====
+VerifyKey.OnServerEvent:Connect(function(player, keyString)
+    if not player or not player.UserId then return end
+    if type(keyString) ~= "string" then
+        KeyResponse:FireClient(player, false, "Key phải là chuỗi.")
+        return
+    end
+    if KeyManager:IsRateLimited(player.UserId) then
+        KeyResponse:FireClient(player, false, "Quá nhiều thử nghiệm. Thử lại sau.")
+        return
+    end
+    if not KeyManager:IsValidKey(keyString) then
+        KeyResponse:FireClient(player, false, "Key sai hoặc đã dùng.")
+        warn(("[SEC] %s tried key '%s' (invalid/used)"):format(player.Name, tostring(keyString)))
+        return
+    end
+    local ok, err = KeyManager:RedeemKey(keyString, player.UserId)
+    if not ok then
+        KeyResponse:FireClient(player, false, err or "Không thể redeem key.")
+        return
+    end
+    -- success: set attribute, log
+    player:SetAttribute("IsVIP", true)
+    KeyResponse:FireClient(player, true, "Key hợp lệ. Đã kích hoạt.")
+    print(("[KEY] %s redeemed key '%s'"):format(player.Name, keyString))
+end)
+
+RequestKeyLink.OnServerInvoke = function(player)
+    return KeyManager:GetKeyLink()
+end
+
+-- ==== DAILY RESET AT 06:00 GMT+7 ====
+local function get_utc_table()
+    return os.date("!*t", os.time())
+end
+
+local function seconds_until_next_6am_gmt7()
+    local utc = get_utc_table()
+    -- convert to seconds and add 7 hours -> GMT+7 now-time table
+    local now_gmt7_seconds = os.time(utc) + 7 * 3600
+    local now_gmt7 = os.date("*t", now_gmt7_seconds)
+    local target = { year = now_gmt7.year, month = now_gmt7.month, day = now_gmt7.day, hour = 6, min = 0, sec = 0 }
+    -- convert target GMT+7 back to UTC epoch:
+    local target_utc_seconds = os.time({
+        year = target.year, month = target.month, day = target.day,
+        hour = target.hour - 7, min = 0, sec = 0
+    })
+    local now_utc_seconds = os.time(utc)
+    local diff = target_utc_seconds - now_utc_seconds
+    if diff <= 0 then diff = diff + 24*3600 end
+    return diff
+end
+
+spawn(function()
+    while true do
+        local waitSec = seconds_until_next_6am_gmt7()
+        if type(waitSec) ~= "number" or waitSec <= 0 then
+            waitSec = 3600
+        end
+        -- wait until next 06:00 GMT+7
+        wait(waitSec + 1)
+        local success, err = pcall(function()
+            KeyManager:ResetKeys()
+            print("[KeyServer] Daily reset executed at 06:00 GMT+7")
+        end)
+        if not success then
+            warn("[KeyServer] Error during daily reset:", err)
+        end
+        wait(2)
+    end
+end)
+
+print("[KeyServer] Ready. Current link:", KeyManager:GetKeyLink())
+
+-- ==== CREATE OR UPDATE LOCALSCRIPT IN StarterPlayer > StarterPlayerScripts ====
+-- We embed the client code below as a long string. The local script will be created/overwritten.
+local clientSource = [[
+-- Client LocalScript injected by server KeySystem
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+local guiParent = player:WaitForChild("PlayerGui")
+
+-- Remotes (must exist from server)
+local VerifyKey = ReplicatedStorage:WaitForChild("VerifyKey")
+local KeyResponse = ReplicatedStorage:WaitForChild("KeyResponse")
+local RequestKeyLink = ReplicatedStorage:WaitForChild("RequestKeyLink")
+
+-- UI Config (sync with server-side title)
+local HubTitle = "]] .. tostring(CONFIG.HubTitle):gsub("\n"," " ) .. [[" 
+local AnimationText = "]] .. tostring(CONFIG.AnimationText):gsub("\n"," ") .. [["
+
+-- build GUI
+local screen = Instance.new("ScreenGui")
+screen.Name = "HaiRoblox_KeyUI"
+screen.ResetOnSpawn = false
+screen.Parent = guiParent
+
+-- shadow for 3D feel
+local shadow = Instance.new("Frame")
+shadow.Size = UDim2.new(0,420,0,280)
+shadow.Position = UDim2.new(0.5, -210, 0.5, -140)
+shadow.BackgroundColor3 = Color3.fromRGB(0,0,0)
+shadow.BackgroundTransparency = 0.6
+shadow.ZIndex = 0
+shadow.Parent = screen
+local sc = Instance.new("UICorner", shadow); sc.CornerRadius = UDim.new(0,12)
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0,400,0,250)
+main.Position = UDim2.new(0.5, -200, 0.5, -125)
+main.BackgroundColor3 = Color3.fromRGB(28,28,28)
+main.BorderSizePixel = 0
+main.ZIndex = 1
+main.Parent = screen
+local mc = Instance.new("UICorner", main); mc.CornerRadius = UDim.new(0,12)
+
+local grad = Instance.new("UIGradient", main)
+grad.Color = ColorSequence.new{
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(45,45,45)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(20,20,20))
+}
+grad.Rotation = 90
+
+local stroke = Instance.new("UIStroke", main)
+stroke.Thickness = 1
+stroke.Color = Color3.fromRGB(80,80,80)
+stroke.Transparency = 0.6
+
+local title = Instance.new("TextLabel", main)
+title.Size = UDim2.new(1,0,0,44)
+title.Position = UDim2.new(0,0,0,0)
+title.BackgroundTransparency = 1
+title.Text = HubTitle .. " - " .. AnimationText
+title.Font = Enum.Font.GothamBold
+title.TextSize = 18
+title.TextColor3 = Color3.fromRGB(255,255,255)
+
+local left = Instance.new("Frame", main)
+left.Size = UDim2.new(0,120,1,-44)
+left.Position = UDim2.new(0,0,0,44)
+left.BackgroundTransparency = 1
+
+local right = Instance.new("Frame", main)
+right.Size = UDim2.new(1,-120,1,-44)
+right.Position = UDim2.new(0,120,0,44)
+right.BackgroundTransparency = 1
+
+local function makeTabButton(text, posY)
+    local btn = Instance.new("TextButton", left)
+    btn.Size = UDim2.new(1, -8, 0, 40)
+    btn.Position = UDim2.new(0,4,0,posY)
+    btn.BackgroundColor3 = Color3.fromRGB(40,40,40)
+    btn.Text = text
+    btn.Font = Enum.Font.Gotham
+    btn.TextSize = 14
+    btn.AutoButtonColor = true
+    local c = Instance.new("UICorner", btn); c.CornerRadius = UDim.new(0,6)
+    return btn
+end
+
+local page1 = Instance.new("Frame", right)
+page1.Size = UDim2.new(1,0,1,0)
+page1.BackgroundTransparency = 1
+
+local pageKey = Instance.new("Frame", right)
+pageKey.Size = UDim2.new(1,0,1,0)
+pageKey.BackgroundTransparency = 1
+pageKey.Visible = false
+
+local tb1 = makeTabButton("Script Farm", 6)
+local tb2 = makeTabButton("Key", 52)
+tb1.MouseButton1Click:Connect(function() page1.Visible = true; pageKey.Visible = false end)
+tb2.MouseButton1Click:Connect(function() page1.Visible = false; pageKey.Visible = true end)
+
+-- Page1 content
+local btnRedz = Instance.new("TextButton", page1)
+btnRedz.Size = UDim2.new(0,200,0,40)
+btnRedz.Position = UDim2.new(0.05, 0, 0.05, 0)
+btnRedz.Text = "Redz Hub"
+btnRedz.Font = Enum.Font.GothamBold
+btnRedz.TextSize = 16
+local cr = Instance.new("UICorner", btnRedz); cr.CornerRadius = UDim.new(0,6)
+btnRedz.MouseButton1Click:Connect(function()
+    pcall(function()
+        game.StarterGui:SetCore("SendNotification", {Title="Info"; Text="Thực thi Redz Hub (server-side safe)"; Duration=2})
+    end)
+end)
+
+-- Key overlay (floating)
+local keyOverlay = Instance.new("Frame", screen)
+keyOverlay.Size = UDim2.new(0,360,0,180)
+keyOverlay.Position = UDim2.new(0.5,-180,0.5,-90)
+keyOverlay.BackgroundColor3 = Color3.fromRGB(18,18,18)
+keyOverlay.ZIndex = 3
+local kc = Instance.new("UICorner", keyOverlay); kc.CornerRadius = UDim.new(0,10)
+keyOverlay.Visible = false
+
+local ktitle = Instance.new("TextLabel", keyOverlay)
+ktitle.Size = UDim2.new(1,0,0,36)
+ktitle.Position = UDim2.new(0,0,0,0)
+ktitle.BackgroundTransparency = 1
+ktitle.Text = "Nhập Key"
+ktitle.Font = Enum.Font.GothamBold
+ktitle.TextSize = 18
+ktitle.TextColor3 = Color3.fromRGB(255,255,255)
+
+local keyBox = Instance.new("TextBox", keyOverlay)
+keyBox.Size = UDim2.new(0.9,0,0,38)
+keyBox.Position = UDim2.new(0.05,0,0.22,0)
+keyBox.PlaceholderText = "Nhập key..."
+keyBox.BackgroundColor3 = Color3.fromRGB(30,30,30)
+local kboxcorner = Instance.new("UICorner", keyBox); kboxcorner.CornerRadius = UDim.new(0,6)
+keyBox.ClearTextOnFocus = false
+
+local submitBtn = Instance.new("TextButton", keyOverlay)
+submitBtn.Size = UDim2.new(0.42,0,0,36)
+submitBtn.Position = UDim2.new(0.05,0,0.6,0)
+submitBtn.Text = "Nhập Key"
+submitBtn.Font = Enum.Font.GothamBold
+local sbc = Instance.new("UICorner", submitBtn); sbc.CornerRadius = UDim.new(0,6)
+
+local getBtn = Instance.new("TextButton", keyOverlay)
+getBtn.Size = UDim2.new(0.42,0,0,36)
+getBtn.Position = UDim2.new(0.53,0,0.6,0)
+getBtn.Text = "Get Key"
+getBtn.Font = Enum.Font.GothamBold
+local gbc = Instance.new("UICorner", getBtn); gbc.CornerRadius = UDim.new(0,6)
+
+local keyMsg = Instance.new("TextLabel", keyOverlay)
+keyMsg.Size = UDim2.new(0.9,0,0,30)
+keyMsg.Position = UDim2.new(0.05,0,0.84,0)
+keyMsg.BackgroundTransparency = 1
+keyMsg.Text = ""
+keyMsg.TextColor3 = Color3.fromRGB(200,200,200)
+
+-- Show overlay when Key tab clicked
+tb2.MouseButton1Click:Connect(function()
+    keyOverlay.Visible = true
+end)
+
+submitBtn.MouseButton1Click:Connect(function()
+    local txt = tostring(keyBox.Text or "")
+    if txt == "" then
+        keyMsg.Text = "Vui lòng nhập key."
+        keyMsg.TextColor3 = Color3.fromRGB(255,120,120)
+        return
+    end
+    VerifyKey:FireServer(txt)
+end)
+
+getBtn.MouseButton1Click:Connect(function()
+    local ok, link = pcall(function() return RequestKeyLink:InvokeServer() end)
+    if not ok or type(link) ~= "string" then
+        keyMsg.Text = "Không thể lấy link từ server."
+        keyMsg.TextColor3 = Color3.fromRGB(255,120,120)
+        return
+    end
+    pcall(function() setclipboard(link) end)
+    keyMsg.Text = "Link Key Hôm Nay đã được sao chép."
+    keyMsg.TextColor3 = Color3.fromRGB(140,255,140)
+end)
+
+KeyResponse.OnClientEvent:Connect(function(success, message)
+    if success then
+        keyMsg.Text = tostring(message or "Key hợp lệ.")
+        keyMsg.TextColor3 = Color3.fromRGB(140,255,140)
+        delay(0.8, function() keyOverlay.Visible = false end)
+    else
+        keyMsg.Text = tostring(message or "Key sai.")
+        keyMsg.TextColor3 = Color3.fromRGB(255,120,120)
+    end
+end)
+
+-- 3D-ish tilt effect
+local maxAngleOffset = 6
+local tiltTweenInfo = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+local function updateTilt(inputPos)
+    local center = main.AbsolutePosition + main.AbsoluteSize/2
+    local dx = (inputPos.X - center.X) / (main.AbsoluteSize.X/2)
+    local dy = (inputPos.Y - center.Y) / (main.AbsoluteSize.Y/2)
+    dx = math.clamp(dx, -1, 1); dy = math.clamp(dy, -1, 1)
+    local offsetX = dx * 6; local offsetY = dy * 6
+    TweenService:Create(main, tiltTweenInfo, {Position = UDim2.new(0.5, -200 + offsetX, 0.5, -125 + offsetY)}):Play()
+    TweenService:Create(shadow, tiltTweenInfo, {Position = UDim2.new(0.5, -210 + offsetX*1.3, 0.5, -140 + offsetY*1.3)}):Play()
+    TweenService:Create(grad, tiltTweenInfo, {Rotation = 90 + (dx * 15)}):Play()
+end
+
+UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement then
+        updateTilt(input.Position)
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement then
+        TweenService:Create(main, tiltTweenInfo, {Position = UDim2.new(0.5, -200, 0.5, -125)}):Play()
+        TweenService:Create(shadow, tiltTweenInfo, {Position = UDim2.new(0.5, -210, 0.5, -140)}):Play()
+        TweenService:Create(grad, tiltTweenInfo, {Rotation = 90}):Play()
+    end
+end)
+
+-- entrance tween
+main.Position = UDim2.new(0.5, -200, 0.5, -200)
+shadow.Position = UDim2.new(0.5, -210, 0.5, -215)
+TweenService:Create(main, TweenInfo.new(0.4, Enum.EasingStyle.Back), {Position = UDim2.new(0.5, -200, 0.5, -125)}):Play()
+TweenService:Create(shadow, TweenInfo.new(0.4, Enum.EasingStyle.Back), {Position = UDim2.new(0.5, -210, 0.5, -140)}):Play()
+]]
+
+-- create or update LocalScript under StarterPlayer > StarterPlayerScripts
+local function createOrUpdateLocalScript()
+    local starterScripts = StarterPlayer:FindFirstChild("StarterPlayerScripts")
+    if not starterScripts then
+        starterScripts = Instance.new("StarterPlayerScripts")
+        starterScripts.Parent = StarterPlayer
+    end
+
+    local existing = starterScripts:FindFirstChild("HaiRoblox_KeyClient")
+    if existing and existing:IsA("LocalScript") then
+        -- update source
+        existing.Source = clientSource
+        print("[KeyServer] Updated existing LocalScript under StarterPlayerScripts.")
+    else
+        if existing then existing:Destroy() end
+        local ls = Instance.new("LocalScript")
+        ls.Name = "HaiRoblox_KeyClient"
+        ls.Source = clientSource
+        ls.Parent = starterScripts
+        print("[KeyServer] Created LocalScript under StarterPlayerScripts.")
+    end
+end
+
+-- Execute creation
+createOrUpdateLocalScript()
+
+-- Print final message
+print("[KeySystem] Single-file setup complete. Put this Script in ServerScriptService. Client UI injected into StarterPlayerScripts.")
